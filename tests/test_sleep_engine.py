@@ -1033,6 +1033,201 @@ class TestMultiObjectiveAndPrefs(unittest.TestCase):
                    [], "skill", "", edit_budget=2, evolve_skill=True, evolve_memory=False)
         self.assertIn("British English", captured["prompt"])
 
+    def test_reflect_does_not_receive_raw_verifier_syntax(self):
+        from skillopt_sleep.backend import CliBackend
+        from skillopt_sleep.types import ReplayResult
+
+        captured = {}
+        pattern = r"(?im)^\s*SKILL:\s*jyoti-prashna-util\s*$"
+        description = "Route this class of request to the consultation utility."
+
+        class CapBackend(CliBackend):
+            name = "cap"
+
+            def _call(self, prompt, *, max_tokens=1024):
+                captured["prompt"] = prompt
+                return "[]"
+
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+        # No optimizer_feedback on purpose: legacy/deserialized results must be
+        # projected safely from the task instead of falling back to fail_reason.
+        result = ReplayResult(
+            id="t",
+            hard=0.0,
+            response="No route declaration here.",
+            fail_reason=f"failed: regex={pattern}",
+        )
+
+        CapBackend().reflect(
+            [(task, result)],
+            [],
+            "skill",
+            "",
+            edit_budget=2,
+            evolve_skill=True,
+            evolve_memory=False,
+        )
+
+        self.assertIn(description, captured["prompt"])
+        self.assertNotIn(pattern, captured["prompt"])
+        self.assertNotIn("regex=", captured["prompt"])
+
+    def test_legacy_non_rule_feedback_fails_closed(self):
+        from skillopt_sleep.backend import _optimizer_feedback
+        from skillopt_sleep.types import ReplayResult
+
+        raw_evidence = "judge implementation: private-evaluator-expression"
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Answer the request",
+            reference_kind="rubric",
+            reference="Give a helpful answer.",
+        )
+        result = ReplayResult(
+            id="t",
+            hard=0.0,
+            fail_reason=raw_evidence,
+            judge_rationale=raw_evidence,
+        )
+
+        feedback = _optimizer_feedback(task, result)
+
+        self.assertNotIn(raw_evidence, feedback)
+        self.assertIn("did not satisfy", feedback)
+
+    def test_supplied_rule_feedback_is_recomputed_from_safe_description(self):
+        from skillopt_sleep.backend import _optimizer_feedback
+        from skillopt_sleep.types import ReplayResult
+
+        pattern = r"(?im)^\\s*SKILL:\\s*jyoti-prashna-util\\s*$"
+        description = "Route this class of request to the consultation utility."
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+        result = ReplayResult(
+            id="t",
+            hard=0.0,
+            response="No route declaration here.",
+            optimizer_feedback=f"unsafe regex={pattern}",
+        )
+
+        feedback = _optimizer_feedback(task, result)
+
+        self.assertEqual(feedback, description)
+        self.assertNotIn(pattern, feedback)
+
+    def test_replay_non_rule_feedback_is_generic_even_when_rationale_is_raw(self):
+        from skillopt_sleep.backend import Backend
+        from skillopt_sleep.replay import replay_one
+
+        pattern = r"private-check-expression"
+
+        class StubBackend(Backend):
+            name = "stub"
+
+            def attempt(self, task, skill, memory, sample_id=0):
+                return "bad"
+
+            def judge(self, task, response):
+                return 0.0, 0.0, f"judge implementation: {pattern}"
+
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Answer the request",
+            reference_kind="rubric",
+            reference="Give a helpful answer.",
+        )
+
+        result = replay_one(StubBackend(), task, "", "")
+
+        self.assertIn(pattern, result.judge_rationale)
+        self.assertNotIn(pattern, result.optimizer_feedback)
+        self.assertIn("did not satisfy", result.optimizer_feedback)
+
+    def test_openclaw_reflect_uses_only_optimizer_feedback(self):
+        import importlib.util
+        from pathlib import Path
+
+        from skillopt_sleep.types import ReplayResult
+
+        backend_path = (
+            Path(__file__).resolve().parents[1]
+            / "plugins"
+            / "openclaw"
+            / "skillopt_sleep_openclaw.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "skillopt_sleep_openclaw_feedback_test", backend_path
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        pattern = r"(?im)^\s*SKILL:\s*jyoti-prashna-util\s*$"
+        description = "Route this class of request to the consultation utility."
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+        failure = ReplayResult(
+            id="t",
+            hard=0.0,
+            response="No route declaration here.",
+            fail_reason=f"failed: regex={pattern}",
+            judge_rationale=f"failed: regex={pattern}",
+        )
+        success = ReplayResult(
+            id="t",
+            hard=1.0,
+            response="good",
+            judge_rationale=f"all checks passed: regex={pattern}",
+        )
+
+        with mock.patch.object(module, "_chat", return_value='{"edits": []}') as chat:
+            module.OpenClawDeepSeekBackend().reflect(
+                [(task, failure)],
+                [(task, success)],
+                "skill",
+                "",
+                edit_budget=2,
+                evolve_skill=True,
+                evolve_memory=False,
+            )
+
+        messages = chat.call_args.args[0]
+        optimizer_prompt = "\n".join(message["content"] for message in messages)
+        self.assertIn(description, optimizer_prompt)
+        self.assertNotIn(pattern, optimizer_prompt)
+        self.assertNotIn("regex=", optimizer_prompt)
+
     def test_reflect_records_last_raw(self):
         # the optimizer's raw reply must be retained so a no-edits night is
         # diagnosable (empty/non-JSON reflect vs genuinely no failures).
@@ -1059,6 +1254,33 @@ class TestMultiObjectiveAndPrefs(unittest.TestCase):
         r = replay_one(MockBackend(), t, "some skill text", "")
         self.assertGreater(r.tokens, 0)
         self.assertGreaterEqual(r.latency_ms, 0.0)
+
+    def test_replay_keeps_raw_evidence_separate_from_optimizer_feedback(self):
+        from skillopt_sleep.backend import MockBackend
+        from skillopt_sleep.replay import replay_one
+
+        pattern = r"(?im)^\s*SKILL:\s*jyoti-prashna-util\s*$"
+        description = "Route this class of request to the consultation utility."
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="Route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+
+        result = replay_one(MockBackend(), task, "", "")
+        serialized = result.to_dict()
+
+        self.assertIn(pattern, result.fail_reason)
+        self.assertIn(pattern, result.judge_rationale)
+        self.assertEqual(result.optimizer_feedback, description)
+        self.assertIn(pattern, serialized["fail_reason"])
+        self.assertNotIn(pattern, serialized["optimizer_feedback"])
 
 
 class TestCodexBackend(unittest.TestCase):
@@ -1273,6 +1495,52 @@ class TestMultiRolloutAndBudget(unittest.TestCase):
         self.assertEqual(len(edits), 1)
         self.assertIn("good thing", edits[0].content)
 
+    def test_contrastive_reflect_hides_raw_verifier_syntax(self):
+        from skillopt_sleep.backend import Backend
+        from skillopt_sleep.rollout import RolloutSet, contrastive_reflect
+        from skillopt_sleep.types import ReplayResult
+
+        captured = {}
+        pattern = r"(?im)^\s*SKILL:\s*jyoti-prashna-util\s*$"
+        description = "Route this class of request to the consultation utility."
+
+        class StubBackend(Backend):
+            name = "stub"
+
+            def _call(self, prompt, *, max_tokens=1024):
+                captured["prompt"] = prompt
+                return "[]"
+
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+        rs = RolloutSet(
+            task=task,
+            attempts=[
+                ReplayResult(id="t", hard=1.0, response="good"),
+                ReplayResult(
+                    id="t",
+                    hard=0.0,
+                    response="bad",
+                    fail_reason=f"failed: regex={pattern}",
+                ),
+            ],
+        )
+
+        contrastive_reflect(StubBackend(), [rs], "skill", "")
+
+        self.assertIn(description, captured["prompt"])
+        self.assertNotIn(pattern, captured["prompt"])
+        self.assertNotIn("regex=", captured["prompt"])
+
 
 class TestSlowUpdate(unittest.TestCase):
     def test_protected_field_roundtrip(self):
@@ -1318,6 +1586,58 @@ class TestSlowUpdate(unittest.TestCase):
         out2 = run_slow_update(StubBackend(), prev_skill="s0", curr_skill="s1",
                                prev_pairs=prev2, curr_pairs=curr2)
         self.assertIn("keep doing X", out2)
+
+    def test_slow_update_hides_raw_verifier_syntax(self):
+        from skillopt_sleep.backend import Backend
+        from skillopt_sleep.slow_update import run_slow_update
+        from skillopt_sleep.types import ReplayResult
+
+        captured = {}
+        pattern = r"(?im)^\s*SKILL:\s*jyoti-prashna-util\s*$"
+        description = "Route this class of request to the consultation utility."
+
+        class StubBackend(Backend):
+            name = "stub"
+
+            def _call(self, prompt, *, max_tokens=1024):
+                captured["prompt"] = prompt
+                return '{"guidance": "keep routing consultation requests"}'
+
+        task = TaskRecord(
+            id="t",
+            project="/p",
+            intent="route a consultation request",
+            reference_kind="rule",
+            judge={
+                "checks": [
+                    {"op": "regex", "arg": pattern, "description": description}
+                ]
+            },
+        )
+        previous = [(task, ReplayResult(id="t", hard=1.0))]
+        current = [
+            (
+                task,
+                ReplayResult(
+                    id="t",
+                    hard=0.0,
+                    response="bad",
+                    fail_reason=f"failed: regex={pattern}",
+                ),
+            )
+        ]
+
+        run_slow_update(
+            StubBackend(),
+            prev_skill="s0",
+            curr_skill="s1",
+            prev_pairs=previous,
+            curr_pairs=current,
+        )
+
+        self.assertIn(description, captured["prompt"])
+        self.assertNotIn(pattern, captured["prompt"])
+        self.assertNotIn("regex=", captured["prompt"])
 
 
 class TestToolLoop(unittest.TestCase):
